@@ -1,5 +1,5 @@
 import os
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 
 def _normalize_fbx_entries(fbx_records):
@@ -90,78 +90,75 @@ def _short_hash(file_hash):
     return file_hash[:8]
 
 
-def _append_path_context(label, basename, basename_counts, previous_path=None, current_path=None):
-    is_ambiguous_name = basename_counts[basename] > 1
-    path_changed = previous_path and current_path and previous_path != current_path
+def _group_status(statuses):
+    unique_statuses = {status for status in statuses if status != 0}
+    if not unique_statuses:
+        return 0
+    if len(unique_statuses) == 1:
+        return unique_statuses.pop()
+    return 3
 
-    if not is_ambiguous_name and not path_changed:
-        return label
 
-    if previous_path and current_path:
-        if previous_path == current_path:
-            return f"{label} {{{current_path}}}"
-        return f"{label} {{from {previous_path} -> {current_path}}}"
+def _format_added_detail(entry):
+    return f"{entry['path']} [new {_short_hash(entry['hash'])}]"
 
-    path_value = current_path or previous_path
-    return f"{label} {{{path_value}}}"
+
+def _format_deleted_detail(entry):
+    return f"{entry['path']} [old {_short_hash(entry['hash'])}]"
+
+
+def _format_changed_detail(entry):
+    if entry["previous_path"] == entry["current_path"]:
+        return (
+            f"{entry['current_path']} "
+            f"[{_short_hash(entry['previous_hash'])} -> {_short_hash(entry['current_hash'])}]"
+        )
+
+    return (
+        f"{entry['previous_path']} [old {_short_hash(entry['previous_hash'])}] -> "
+        f"{entry['current_path']} [new {_short_hash(entry['current_hash'])}]"
+    )
 
 
 def build_fbx_path_list(added_entries, changed_entries, deleted_entries):
-    basename_counts = Counter()
+    groups = defaultdict(list)
 
-    for entry in added_entries:
-        basename_counts[entry["basename"]] += 1
-    for entry in changed_entries:
-        basename_counts[entry["basename"]] += 1
-    for entry in deleted_entries:
-        basename_counts[entry["basename"]] += 1
-
-    path_list = []
-
-    for entry in added_entries:
-        label = _append_path_context(
-            entry["basename"],
-            entry["basename"],
-            basename_counts,
-            current_path=entry["path"],
-        )
-        path_list.append(
+    for entry in sorted(
+        changed_entries,
+        key=lambda item: (item["basename"], item["current_path"], item["previous_path"]),
+    ):
+        groups[entry["basename"]].append(
             {
-                "line_str": f"{label} [new {_short_hash(entry['hash'])}]",
-                "status": 1,
-            }
-        )
-
-    for entry in changed_entries:
-        label = _append_path_context(
-            entry["basename"],
-            entry["basename"],
-            basename_counts,
-            previous_path=entry["previous_path"],
-            current_path=entry["current_path"],
-        )
-        path_list.append(
-            {
-                "line_str": (
-                    f"{label} "
-                    f"[{_short_hash(entry['previous_hash'])} -> {_short_hash(entry['current_hash'])}]"
-                ),
+                "line_str": f"    {_format_changed_detail(entry)}",
                 "status": 3,
             }
         )
 
-    for entry in deleted_entries:
-        label = _append_path_context(
-            entry["basename"],
-            entry["basename"],
-            basename_counts,
-            previous_path=entry["path"],
-        )
-        path_list.append(
+    for entry in sorted(added_entries, key=lambda item: (item["basename"], item["path"])):
+        groups[entry["basename"]].append(
             {
-                "line_str": f"{label} [old {_short_hash(entry['hash'])}]",
+                "line_str": f"    {_format_added_detail(entry)}",
+                "status": 1,
+            }
+        )
+
+    for entry in sorted(deleted_entries, key=lambda item: (item["basename"], item["path"])):
+        groups[entry["basename"]].append(
+            {
+                "line_str": f"    {_format_deleted_detail(entry)}",
                 "status": 2,
             }
         )
+
+    path_list = []
+    for basename in sorted(groups):
+        child_items = groups[basename]
+        path_list.append(
+            {
+                "line_str": basename,
+                "status": _group_status(item["status"] for item in child_items),
+            }
+        )
+        path_list.extend(child_items)
 
     return path_list
