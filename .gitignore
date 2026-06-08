@@ -16,3 +16,7 @@ changelog
 
 test.sh
 *-test.yml
+
+# Claude / AI tooling
+.claude/
+.omc/
