@@ -13,15 +13,34 @@ class google_gemini_api:
         self.client = genai.Client(api_key=gemini_api_key)
 
     def chat(self, message):
-        response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=self.sys_instruct),
-            contents=[message]
-        )
-        text = response.candidates[0].content.parts[0].text
-        if len(text) > 1021:
-            return text[:1021] + "..."
-        else:
-            return text
+        try:
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash",
+                config=types.GenerateContentConfig(
+                    system_instruction=self.sys_instruct),
+                contents=[message]
+            )
+
+            candidates = getattr(response, "candidates", None)
+            if not candidates:
+                return ""
+
+            content = getattr(candidates[0], "content", None)
+            if content is None:
+                return ""
+
+            parts = getattr(content, "parts", None)
+            if not parts:
+                return ""
+
+            text = getattr(parts[0], "text", None)
+            if not text:
+                return ""
+
+            if len(text) > 1021:
+                return text[:1021] + "..."
+            else:
+                return text
+        except Exception:
+            return ""
         
