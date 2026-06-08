@@ -22,9 +22,10 @@ def _extract_download_info(div, link_selector, filename_selector):
     return [match.group(1), filename]
 
 def _crawling_base(url, cookie, selectors, shortlist, thumblist, product_only_filter=None):
-    response = requests.get(url=url, cookies=cookie)
+    response = requests.get(url=url, cookies=cookie, timeout=30)
+    response.raise_for_status()
     html = response.content
-    
+
     download_url_list = []
     product_info_list = []
     soup = BeautifulSoup(html, "html.parser")
@@ -107,22 +108,30 @@ def crawling_gift(order_num, cookie, shortlist=None, thumblist=None):
 def download_item(download_number, filepath, cookie):
     url = f'https://booth.pm/downloadables/{download_number}'
     
-    response = requests.get(url=url, cookies=cookie)
-    open(filepath, "wb").write(response.content)
+    response = requests.get(url=url, cookies=cookie, timeout=60)
+    response.raise_for_status()
+    with open(filepath, "wb") as f:
+        f.write(response.content)
 
 
 def crawling_product(url):
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
     html = response.content
-    
+
     soup = BeautifulSoup(html, "html.parser")
     author_div = soup.find("a", class_="flex gap-4 items-center no-underline preserve-half-leading !text-current typography-16 w-fit")
     # None: private store
     if author_div is None:
         return None
-    
+
     author_image = author_div.select_one("img")
+    if author_image is None:
+        return None
+
     author_image_url = author_image.get("src")
     author_name = author_image.get("alt")
-    
+    if not author_image_url or not author_name:
+        return None
+
     return [author_image_url, author_name]
