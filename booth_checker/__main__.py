@@ -3,6 +3,7 @@ import zipfile
 import hashlib
 import traceback
 import os
+import tempfile
 import requests
 import re
 import uuid
@@ -29,8 +30,16 @@ from logging_setup import attach_syslog_handler
 
 DRY_RUN = None
 
+# Base directory for per-item working folders (created/recreated each cycle).
+WORK_ROOT = './work'
+
 # Setup robust logger
 thread_local = threading.local()
+
+# Tracks which users have had their error state reset this cycle (dedup so we
+# do not POST /reset_error once per item per cycle).
+reset_users_this_cycle = set()
+reset_users_lock = threading.Lock()
 
 class ContextFilter(logging.Filter):
     def filter(self, record):
@@ -54,6 +63,12 @@ if all(not isinstance(f, ContextFilter) for f in logger.filters):
 
 class BoothCrawlError(Exception):
     """Custom exception for BOOTH crawling failures."""
+    pass
+
+class ChangelogError(Exception):
+    """Raised when changelog generation cannot be trusted (e.g. an archive
+    failed to extract/parse), so the item must be retried next cycle instead
+    of advancing the version file with a misleading diff."""
     pass
 
 # mark_as
@@ -165,13 +180,15 @@ def load_and_compare_version(order_num, download_short_list, fbx_only):
 
     return version_file_path, version_json, has_changed
 
-def process_files_for_changelog(item_data, download_url_list, local_list):
+def process_files_for_changelog(item_data, download_url_list, local_list, download_dir):
     """Downloads new files and archives them if configured."""
     item_name_list = []
-    archive_folder = f'./archive/{strftime_now()}'
+    # Namespace archives per order so concurrent items processed within the
+    # same second cannot collide on a shared timestamp folder.
+    archive_folder = f'./archive/{item_data["order_num"]}/{strftime_now()}'
 
     for download_number, filename in download_url_list:
-        download_path = f'./download/{filename}'
+        download_path = os.path.join(download_dir, filename)
         item_name_list.append(filename)
 
         should_download = item_data["changelog_show"] or item_data["archive_this"] or item_data["fbx_only"]
@@ -187,27 +204,33 @@ def process_files_for_changelog(item_data, download_url_list, local_list):
     
     return item_name_list
 
-def generate_changelog_and_summary(item_data, download_url_list, version_json):
+def generate_changelog_and_summary(item_data, download_url_list, version_json, download_dir, process_dir):
     """Generates changelog content and returns metadata.
 
     Returns:
         tuple: (changelog_html_path, s3_object_url, summary_result, diff_found, new_fbx_records)
+
+    Raises:
+        ChangelogError: if any archive fails to extract/parse, so the caller
+            can skip notifying and retry next cycle instead of emitting a diff
+            that would falsely mark unparsed files as Deleted.
     """
     if item_data["fbx_only"]:
-        return generate_fbx_changelog_and_summary(item_data, download_url_list, version_json)
+        return generate_fbx_changelog_and_summary(item_data, download_url_list, version_json, download_dir, process_dir)
 
     saved_prehash = {}
     for local_file in version_json['files'].keys():
         element_mark(version_json['files'][local_file], 2, local_file, saved_prehash)
-        
+
     for _, filename in download_url_list:
-        download_path = f'./download/{filename}'
+        download_path = os.path.join(download_dir, filename)
         logger.info(f'parsing {filename} structure')
         try:
-            process_file_tree(download_path, filename, version_json, item_data["encoding"], [])
+            process_file_tree(download_path, filename, version_json, item_data["encoding"], [], process_dir)
         except Exception as e:
             logger.error(f'An error occurred while parsing {filename}: {e}')
             logger.debug(traceback.format_exc())
+            raise ChangelogError(f'failed to parse {filename}') from e
 
     path_list = generate_path_info(version_json, saved_prehash)
     diff_found = bool(path_list)
@@ -256,19 +279,25 @@ def generate_changelog_and_summary(item_data, download_url_list, version_json):
 
     return changelog_html_path, s3_object_url, summary_result, diff_found, None
 
-def generate_fbx_changelog_and_summary(item_data, download_url_list, version_json):
-    """Generates changelog information for FBX-only tracking."""
+def generate_fbx_changelog_and_summary(item_data, download_url_list, version_json, download_dir, process_dir):
+    """Generates changelog information for FBX-only tracking.
+
+    Raises:
+        ChangelogError: if any archive fails to parse, so the caller retries
+            next cycle instead of computing an FBX diff from partial data.
+    """
     previous_fbx = version_json.get('fbx-files', {}) or {}
     current_fbx = {}
 
     for _, filename in download_url_list:
-        download_path = f'./download/{filename}'
+        download_path = os.path.join(download_dir, filename)
         logger.info(f'parsing {filename} structure (FBX only)')
         try:
-            process_file_tree(download_path, filename, None, item_data["encoding"], [], fbx_only=True, fbx_records=current_fbx)
+            process_file_tree(download_path, filename, None, item_data["encoding"], [], process_dir, fbx_only=True, fbx_records=current_fbx)
         except Exception as e:
             logger.error(f'An error occurred while parsing {filename}: {e}')
             logger.debug(traceback.format_exc())
+            raise ChangelogError(f'failed to parse {filename}') from e
 
     added_entries, changed_entries, deleted_entries = calculate_fbx_diff(previous_fbx, current_fbx)
 
@@ -396,8 +425,15 @@ def update_version_file(version_file_path, version_json, item_name_list, downloa
     elif 'fbx-files' not in version_json:
         version_json['fbx-files'] = {}
     
-    with open(version_file_path, 'w') as f:
+    # Atomic write: dump to a temp file in the same directory, fsync, then
+    # os.replace so a crash mid-write cannot truncate the version file (which
+    # would otherwise wipe short-list and trigger a full false re-notification).
+    tmp_path = f'{version_file_path}.tmp'
+    with open(tmp_path, 'w') as f:
         simdjson.dump(version_json, fp=f, indent=4)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, version_file_path)
 
 def init_update_check(item): # This is the main orchestrator function
     item_data = prepare_item_data(item)
@@ -412,6 +448,10 @@ def init_update_check(item): # This is the main orchestrator function
         logger.exception("An unexpected error occurred during fetch_booth_data")
         return
 
+    # Crawl succeeded → clear any prior error state for this user so a future
+    # failure will notify them again.
+    reset_error_notification(item_data["discord_user_id"])
+
     product_name, product_url = product_info_list[0]
     if item_data["name"] is None:
         item_data["name"] = product_name
@@ -422,42 +462,67 @@ def init_update_check(item): # This is the main orchestrator function
 
     local_list = version_json.get('short-list', [])
     local_list_name = version_json.get('name-list', [])
-    
-    item_name_list = process_files_for_changelog(item_data, download_url_list, local_list) # This is a new helper function
 
-    changelog_html_path, s3_object_url, summary_result = None, None, None
-    diff_found = download_list_changed
-    new_fbx_records = None
+    # Per-item working directories so concurrent worker threads never share
+    # ./download/<name> or ./process/<path>. Cleaned up in finally.
+    work_dir = tempfile.mkdtemp(prefix=f'{order_num}_', dir=WORK_ROOT)
+    download_dir = os.path.join(work_dir, 'download')
+    process_dir = os.path.join(work_dir, 'process')
+    os.makedirs(download_dir, exist_ok=True)
+    os.makedirs(process_dir, exist_ok=True)
 
-    if item_data["changelog_show"] or item_data["fbx_only"]:
-        changelog_html_path, s3_object_url, summary_result, calc_diff_found, new_fbx_records = generate_changelog_and_summary(
-            item_data, download_url_list, version_json
+    changelog_html_path = None
+    try:
+        item_name_list = process_files_for_changelog(item_data, download_url_list, local_list, download_dir)
+
+        s3_object_url, summary_result = None, None
+        diff_found = download_list_changed
+        new_fbx_records = None
+
+        if item_data["changelog_show"] or item_data["fbx_only"]:
+            try:
+                changelog_html_path, s3_object_url, summary_result, calc_diff_found, new_fbx_records = generate_changelog_and_summary(
+                    item_data, download_url_list, version_json, download_dir, process_dir
+                )
+            except ChangelogError as e:
+                logger.error(
+                    f'변경점 분석 실패로 알림/버전 갱신을 건너뜁니다. '
+                    f'다음 사이클에 재시도합니다. (order {order_num}): {e}'
+                )
+                return
+            if item_data["fbx_only"]:
+                diff_found = calc_diff_found
+            elif item_data["changelog_show"]:
+                diff_found = calc_diff_found or diff_found
+
+        if item_data["fbx_only"] and not diff_found:
+            logger.info('FBX contents unchanged. Skipping notification.')
+            update_version_file(version_file_path, version_json, item_name_list, download_short_list, item_data["fbx_only"], new_fbx_records)
+            return
+
+        thumb = thumblist[0] if thumblist else "https://asset.booth.pm/assets/thumbnail_placeholder_f_150x150-73e650fbec3b150090cbda36377f1a3402c01e36fa067d01.png"
+
+        delivered = send_discord_notification(
+            item_data, (product_name, product_url), thumb, local_list_name,
+            item_name_list, changelog_html_path, s3_object_url, summary_result
         )
-        if item_data["fbx_only"]:
-            diff_found = calc_diff_found
-        elif item_data["changelog_show"]:
-            diff_found = calc_diff_found or diff_found
 
-    if item_data["fbx_only"] and not diff_found:
-        logger.info('FBX contents unchanged. Skipping notification.')
+        if not delivered:
+            logger.error(
+                f'Discord 전달이 확인되지 않아 버전 파일을 갱신하지 않습니다. '
+                f'다음 사이클에 재발송됩니다. (order {order_num})'
+            )
+            return
+
         update_version_file(version_file_path, version_json, item_name_list, download_short_list, item_data["fbx_only"], new_fbx_records)
-        return
-
-    thumb = thumblist[0] if thumblist else "https://asset.booth.pm/assets/thumbnail_placeholder_f_150x150-73e650fbec3b150090cbda36377f1a3402c01e36fa067d01.png"
-
-    delivered = send_discord_notification(
-        item_data, (product_name, product_url), thumb, local_list_name,
-        item_name_list, changelog_html_path, s3_object_url, summary_result
-    )
-
-    if not delivered:
-        logger.error(
-            f'Discord 전달이 확인되지 않아 버전 파일을 갱신하지 않습니다. '
-            f'다음 사이클에 재발송됩니다. (order {order_num})'
-        )
-        return
-
-    update_version_file(version_file_path, version_json, item_name_list, download_short_list, item_data["fbx_only"], new_fbx_records)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        # Drop the local changelog HTML once it has been delivered/uploaded.
+        if changelog_html_path and not DRY_RUN and os.path.exists(changelog_html_path):
+            try:
+                os.remove(changelog_html_path)
+            except OSError:
+                pass
 
 def generate_path_info(root, saved_prehash):
     path_list = []
@@ -472,7 +537,9 @@ def _generate_path_info_recursive(root, saved_prehash, path_list, current_level=
     for file_name, file_node in files.items():
         file_info = {'line_str': '', 'status': file_node['mark_as']}
 
-        file_info['line_str'] += ' ' * 8 * current_level
+        # 4 spaces per level: build_tree() derives depth via indent // 4, and
+        # the FBX path (build_fbx_path_list) also uses 4-space indentation.
+        file_info['line_str'] += ' ' * 4 * current_level
 
         symbol = ''
         if file_info['status'] == 1:
@@ -499,27 +566,29 @@ def _generate_path_info_recursive(root, saved_prehash, path_list, current_level=
         path_list.append(file_info)
         _generate_path_info_recursive(file_node, saved_prehash, path_list, current_level + 1)
 
-def process_file_tree(input_path, filename, version_json, encoding, current_path, fbx_only=False, fbx_records=None):
+def process_file_tree(input_path, filename, version_json, encoding, current_path, process_dir, fbx_only=False, fbx_records=None):
     current_path.append(filename)
-    
+
     pathstr = '/'.join(current_path)
-    
+
     isdir = os.path.isdir(input_path)
     filehash = ""
     if not isdir:
         filehash = calc_file_hash(input_path)
     else:
         filehash = "DIRECTORY"
-        
-    process_path = f'./process/{pathstr}'
+
+    process_path = os.path.join(process_dir, pathstr)
     try:
-        zip_type = try_extract(input_path, filename, process_path, encoding)
+        zip_type = try_extract(input_path, filename, process_path, encoding, process_dir)
     except Exception as e:
+        # Propagate: a swallowed extraction failure would leave existing files
+        # marked Deleted (element_mark pre-marks everything as deleted), so the
+        # caller must abort the changelog and retry next cycle instead.
         logger.error(f'error occured on extracting {filename}: {e}')
         logger.debug(traceback.format_exc())
         current_path.pop()
-        end_file_process(0, process_path)
-        return
+        raise
     
     if not fbx_only:
         node = version_json
@@ -544,7 +613,7 @@ def process_file_tree(input_path, filename, version_json, encoding, current_path
     if zip_type > 0 or os.path.isdir(process_path):
         for new_filename in os.listdir(process_path):
             new_process_path = os.path.join(process_path, new_filename)
-            process_file_tree(new_process_path, new_filename, version_json, encoding, current_path, fbx_only=fbx_only, fbx_records=fbx_records)
+            process_file_tree(new_process_path, new_filename, version_json, encoding, current_path, process_dir, fbx_only=fbx_only, fbx_records=fbx_records)
 
     current_path.pop()
     end_file_process(zip_type, process_path)
@@ -559,16 +628,18 @@ def end_file_process(zip_type, process_path):
         os.remove(process_path)
     
 # NOTE: Currently, @encoding only applies on zip_type == 1
-def try_extract(input_path, input_filename, output_path, encoding):
+def try_extract(input_path, input_filename, output_path, encoding, temp_dir):
     """Extracts a file if it's a zip or unitypackage, otherwise just moves it."""
     zip_type = is_compressed(input_path)
-    
+
     if zip_type == 0:
         shutil.move(input_path, output_path)
         return zip_type
 
-    # For compressed files, move to a temporary location for extraction
-    temp_output = f'./{input_filename}'
+    # For compressed files, move to a temporary location for extraction.
+    # temp_dir is the per-item working directory, so concurrent items cannot
+    # collide on a shared CWD-root temp file.
+    temp_output = os.path.join(temp_dir, f'__extract_tmp_{input_filename}')
     shutil.move(input_path, temp_output)
     os.makedirs(output_path, exist_ok=True)
 
@@ -599,10 +670,11 @@ def is_compressed(path):
     return 0
 
 def calc_file_hash(path):
+    hash = hashlib.md5()
     with open(path, 'rb') as f:
-        data = f.read()
-        hash = hashlib.md5(data).hexdigest()
-    return hash
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            hash.update(chunk)
+    return hash.hexdigest()
 
 
 def element_mark(root, mark_as, current_filename, prehash_dict): 
@@ -757,7 +829,11 @@ def send_error_message(discord_channel_id, discord_user_id):
         'user_id': discord_user_id
     }
 
-    response = requests.post(api_url, json=data)
+    try:
+        response = requests.post(api_url, json=data, timeout=30)
+    except requests.RequestException as e:
+        logger.error(f'send_error_message API 요청 실패: {e}')
+        return
 
     if response.status_code == 200:
         logger.info('send_error_message API 요청 성공')
@@ -765,11 +841,57 @@ def send_error_message(discord_channel_id, discord_user_id):
         logger.error(f'send_error_message API 요청 실패: {response.text}')
     return
 
+def reset_error_notification(discord_user_id):
+    """Best-effort: tell the discord service to clear a user's accumulated error
+    state after a successful crawl, so a later failure re-notifies them. Deduped
+    per cycle to avoid one request per item."""
+    if DRY_RUN or discord_user_id is None:
+        return
+    with reset_users_lock:
+        if discord_user_id in reset_users_this_cycle:
+            return
+        reset_users_this_cycle.add(discord_user_id)
+    try:
+        requests.post(f'{discord_api_url}/reset_error', json={'user_id': discord_user_id}, timeout=10)
+    except requests.RequestException as e:
+        logger.debug(f'reset_error 요청 실패(무시): {e}')
+
 def recreate_folder(path):
     """Deletes a folder and all its contents, then recreates it."""
     if os.path.exists(path):
         shutil.rmtree(path)
     os.makedirs(path)
+
+def prune_old_archives(base_path, retention_days):
+    """Removes archive timestamp folders older than retention_days.
+
+    Archives live at ./archive/<order_num>/<timestamp>/. retention_days <= 0
+    disables pruning (keep forever).
+    """
+    if retention_days <= 0 or not os.path.isdir(base_path):
+        return
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    for order_dir in os.listdir(base_path):
+        order_path = os.path.join(base_path, order_dir)
+        if not os.path.isdir(order_path):
+            continue
+        for ts_dir in os.listdir(order_path):
+            ts_path = os.path.join(order_path, ts_dir)
+            if not os.path.isdir(ts_path):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(ts_path))
+            except OSError:
+                continue
+            if mtime < cutoff:
+                logger.info(f'Pruning old archive: {ts_path}')
+                shutil.rmtree(ts_path, ignore_errors=True)
+        # Drop the order folder if it is now empty.
+        try:
+            if not os.listdir(order_path):
+                os.rmdir(order_path)
+        except OSError:
+            pass
 
 def run_update_check_safely(item):
     thread_local.order_num = item[0]
@@ -811,7 +933,10 @@ if __name__ == "__main__":
         logger.info("Gemini API key not found")
         
     refresh_interval = int(config_json['refresh_interval'])
-    
+
+    # Archive retention in days (<= 0 keeps forever). Pruned at each cycle start.
+    archive_retention_days = int(config_json.get('archive_retention_days', 30))
+
     DRY_RUN = config_json.get('dry_run', False)
     logger.info(f"Dry run is {'enabled' if DRY_RUN else 'disabled'}.")
 
@@ -838,8 +963,7 @@ if __name__ == "__main__":
     createFolder("./version/json")
     createFolder("./archive")
     createFolder("./changelog")
-    createFolder("./download")
-    createFolder("./process")
+    createFolder(WORK_ROOT)
 
     postgres_config = dict(config_json['postgres'])
     booth_db = booth_sql.BoothPostgres(postgres_config)
@@ -866,9 +990,11 @@ if __name__ == "__main__":
     while True:
         logger.info("BoothChecker cycle started")
 
-        # Recreate temporary folders
-        recreate_folder("./download")
-        recreate_folder("./process")
+        # Recreate the working root and prune stale archives.
+        recreate_folder(WORK_ROOT)
+        prune_old_archives("./archive", archive_retention_days)
+        with reset_users_lock:
+            reset_users_this_cycle.clear()
 
         booth_items = booth_db.get_booth_items()
         logger.info(f"Found {len(booth_items)} items to check.")

@@ -1,5 +1,6 @@
 {
     "refresh_interval": 600,
+    "archive_retention_days": 30,
     "selenium_url": "http://chrome:4444/wd/hub",
     "postgres": {
         "host": "postgres",
