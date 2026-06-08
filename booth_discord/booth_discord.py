@@ -24,19 +24,23 @@ class DiscordBot(commands.Bot):
 
     async def setup_hook(self):
         # 봇이 로그인된 후, 준비되기 전에 호출되는 메서드
-        # 여기서 웹 서버를 시작합니다.
-        asyncio.create_task(self.run_app())
+        # 여기서 웹 서버를 시작합니다. 태스크 참조를 보관해 GC를 방지합니다.
+        self._app_task = asyncio.create_task(self.run_app())
 
     async def run_app(self):
         # Quart 앱 실행
-        await self.app.run_task(host='0.0.0.0', port=5000)
+        try:
+            await self.app.run_task(host='0.0.0.0', port=5000)
+        except Exception:
+            self.logger.exception("Quart app crashed")
+            raise
 
     def setup_commands(self):
         @self.tree.command(name="booth", description="BOOTH 계정 등록")
         @app_commands.describe(cookie="""BOOTH.pm의 "_plaza_session_nktz7u"의 쿠키 값을 입력 해주세요""")
         async def booth(interaction: discord.Interaction, cookie: str):
             try:
-                self.booth_db.add_booth_account(cookie, interaction.user.id)
+                await asyncio.to_thread(self.booth_db.add_booth_account, cookie, interaction.user.id)
                 self.logger.info(f"User {interaction.user.id} is registering BOOTH account")
                 await interaction.response.send_message("BOOTH 계정 등록 완료", ephemeral=True)
             except Exception as e:
@@ -61,7 +65,8 @@ class DiscordBot(commands.Bot):
         ):
             try:
                 await interaction.response.defer(ephemeral=True)
-                self.booth_db.add_booth_item(
+                await asyncio.to_thread(
+                    self.booth_db.add_booth_item,
                     interaction.user.id,
                     interaction.channel_id,
                     item_number,
@@ -83,7 +88,7 @@ class DiscordBot(commands.Bot):
         @self.tree.command(name="booth_del", description="BOOTH 계정 등록 해제")
         async def booth_del(interaction: discord.Interaction):
             try:
-                self.booth_db.del_booth_account(interaction.user.id)
+                await asyncio.to_thread(self.booth_db.del_booth_account, interaction.user.id)
                 self.logger.info(f"User {interaction.user.id} is removing BOOTH account")
                 await interaction.response.send_message("BOOTH 계정 삭제 완료", ephemeral=True)
             except Exception as e:
@@ -94,7 +99,7 @@ class DiscordBot(commands.Bot):
         @app_commands.describe(item="BOOTH 상품 번호를 입력해주세요")
         async def item_del(interaction: discord.Interaction, item: str):
             try:
-                self.booth_db.del_booth_item(interaction.user.id, item)
+                await asyncio.to_thread(self.booth_db.del_booth_item, interaction.user.id, item)
                 self.logger.info(f"User {interaction.user.id} is removing item {item}")
                 await interaction.response.send_message(f"[{item}] 삭제 완료", ephemeral=True)
             except Exception as e:
@@ -104,7 +109,7 @@ class DiscordBot(commands.Bot):
         @self.tree.command(name="item_list", description="아이템 목록 확인")
         async def item_list(interaction: discord.Interaction):
             try:
-                items = self.booth_db.list_booth_items(interaction.user.id, interaction.channel_id)
+                items = await asyncio.to_thread(self.booth_db.list_booth_items, interaction.user.id, interaction.channel_id)
                 if items:
                     items_list = [row[0] for row in items]
                     items_list = '\n'.join([f' - {i}' for i in items_list])
@@ -121,7 +126,7 @@ class DiscordBot(commands.Bot):
         @app_commands.describe(item_number="이 채널에서 업데이트 알림을 받을 아이템 번호를 입력해주세요")
         async def noti_update(interaction: discord.Interaction, item_number: str):
             try:
-                self.booth_db.update_discord_noti_channel(interaction.user.id, interaction.channel.id, item_number)
+                await asyncio.to_thread(self.booth_db.update_discord_noti_channel, interaction.user.id, interaction.channel.id, item_number)
                 self.logger.info(f"User {interaction.user.id} is setting update notification channel")
                 await interaction.response.send_message("업데이트 알림 채널 설정 완료", ephemeral=True)
             except Exception as e:
@@ -131,7 +136,9 @@ class DiscordBot(commands.Bot):
     def setup_routes(self):
         @self.app.route("/send_message", methods=["POST"])
         async def handle_send_message():
-            data = await request.get_json()
+            data = await request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"status": "bad request"}), 400
 
             name = data.get("name")
             url = data.get("url")
@@ -169,15 +176,32 @@ class DiscordBot(commands.Bot):
 
         @self.app.route("/send_error_message", methods=["POST"])
         async def handle_send_error_message():
-            data = await request.get_json()
+            data = await request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"status": "bad request"}), 400
             channel_id = data.get("channel_id")
             user_id = data.get("user_id")
-            await self.send_error_message(channel_id, user_id)
+            try:
+                await self.send_error_message(channel_id, user_id)
+            except Exception as e:
+                self.logger.exception("send_error_message failed")
+                return jsonify({"status": "send failed", "error": str(e)}), 502
             return jsonify({"status": "Error message sent"}), 200
-        
+
+        @self.app.route("/reset_error", methods=["POST"])
+        async def handle_reset_error():
+            data = await request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"status": "bad request"}), 400
+            user_id = data.get("user_id")
+            self.reset_error_count(user_id)
+            return jsonify({"status": "reset"}), 200
+
         @self.app.route("/send_changelog", methods=["POST"])
         async def handle_send_changelog():
-            data = await request.get_json()
+            data = await request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"status": "bad request"}), 400
             channel_id = data.get("channel_id")
             file = data.get("file")
             try:
@@ -232,7 +256,7 @@ class DiscordBot(commands.Bot):
         self.logger.warning(f"Error checking items for user {discord_user_id}. Error count: {count}")
         self.error_counts[key] = count
 
-        booth_item_count = self.booth_db.get_booth_item_count(discord_user_id)
+        booth_item_count = await asyncio.to_thread(self.booth_db.get_booth_item_count, discord_user_id)
         booth_item_count = max(booth_item_count, 1)  # Enforce a minimum threshold of 1
 
         # Notify user only if errors persist for all their items and they haven't been notified yet.
@@ -249,6 +273,18 @@ class DiscordBot(commands.Bot):
             )
             await channel.send(content=f'<@{discord_user_id}>', embed=embed)
             self.logger.info(f"Sent persistent error notification to user {discord_user_id}")
+
+    def reset_error_count(self, discord_user_id):
+        """Clears a user's accumulated error state after a successful check, so a
+        later failure (e.g. a fresh cookie expiry) notifies them again instead of
+        being permanently suppressed."""
+        if discord_user_id is None:
+            return
+        key = f'{discord_user_id}_error_count'
+        had_state = self.error_counts.pop(key, None) is not None or discord_user_id in self.error_count_user
+        self.error_count_user.discard(discord_user_id)
+        if had_state:
+            self.logger.info(f"Reset error state for user {discord_user_id}")
 
     async def send_changelog(self, channel_id, file):
         channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))

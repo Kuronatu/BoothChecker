@@ -1,3 +1,5 @@
+import functools
+import threading
 import time
 from contextlib import contextmanager
 
@@ -5,10 +7,19 @@ import psycopg
 from psycopg import errors as pg_errors
 
 
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class BoothPostgres:
     def __init__(self, conn_params, booth, logger):
         self.logger = logger
         self.booth = booth
+        self._lock = threading.RLock()
         self.conn = self._connect_with_retry(conn_params)
         self.conn.autocommit = True
 
@@ -75,6 +86,7 @@ class BoothPostgres:
             with self.conn.cursor() as cursor:
                 yield cursor
 
+    @_synchronized
     def add_booth_account(self, session_cookie, discord_user_id):
         with self.conn.cursor() as cursor:
             cursor.execute('''
@@ -100,6 +112,7 @@ class BoothPostgres:
                 ''', (session_cookie, discord_user_id))
         return self.get_booth_account(discord_user_id)
 
+    @_synchronized
     def add_booth_item(self, discord_user_id, discord_channel_id, booth_item_number, booth_order_number, item_name, intent_encoding, summary_this, fbx_only):
         booth_account = self.get_booth_account(discord_user_id)
         if self.is_item_duplicate(booth_item_number, discord_user_id):
@@ -150,6 +163,7 @@ class BoothPostgres:
             raise Exception("아이템 등록 중 충돌이 발생했습니다.") from exc
         return booth_order_info[1]
 
+    @_synchronized
     def del_booth_account(self, discord_user_id):
         try:
             with self.conn.cursor() as cursor:
@@ -168,9 +182,10 @@ class BoothPostgres:
                     DELETE FROM booth_accounts WHERE discord_user_id = %s
                 ''', (discord_user_id,))
                 return cursor.rowcount
-        except Exception as exc:
-            raise Exception(exc)
+        except Exception:
+            raise
 
+    @_synchronized
     def del_booth_item(self, discord_user_id, booth_item_number):
         booth_account = self.get_booth_account(discord_user_id)
         if not booth_account:
@@ -201,9 +216,10 @@ class BoothPostgres:
                 ''', (booth_item_number, discord_user_id))
                 deleted_items = cursor.rowcount
             return {'items_deleted': deleted_items, 'channels_deleted': deleted_channels}
-        except Exception as exc:
-            raise Exception(exc)
+        except Exception:
+            raise
 
+    @_synchronized
     def get_booth_account(self, discord_user_id):
         with self.conn.cursor() as cursor:
             cursor.execute('''
@@ -213,6 +229,7 @@ class BoothPostgres:
             result = cursor.fetchone()
         return result if result else None
 
+    @_synchronized
     def is_item_duplicate(self, booth_item_number, discord_user_id):
         with self.conn.cursor() as cursor:
             cursor.execute('''
@@ -221,6 +238,7 @@ class BoothPostgres:
             ''', (booth_item_number, discord_user_id))
             return cursor.fetchone() is not None
 
+    @_synchronized
     def list_booth_items(self, discord_user_id, discord_channel_id):
         booth_account = self.get_booth_account(discord_user_id)
         if not booth_account:
@@ -237,6 +255,7 @@ class BoothPostgres:
             ''', (discord_user_id, discord_channel_id))
             return cursor.fetchall()
 
+    @_synchronized
     def add_discord_noti_channel(self, discord_channel_id, booth_order_number, use_transaction=True, cursor=None):
         if cursor is not None:
             return self._insert_discord_noti_channel(cursor, discord_channel_id, booth_order_number)
@@ -246,6 +265,7 @@ class BoothPostgres:
         with self.conn.cursor() as standalone_cursor:
             return self._insert_discord_noti_channel(standalone_cursor, discord_channel_id, booth_order_number)
 
+    @_synchronized
     def del_discord_noti_channel(self, booth_order_number, use_transaction=True, cursor=None):
         self.logger.debug("del_discord_noti_channel - booth_order_number : %s", booth_order_number)
         if cursor is not None:
@@ -256,6 +276,7 @@ class BoothPostgres:
         with self.conn.cursor() as standalone_cursor:
             return self._delete_discord_noti_channel(standalone_cursor, booth_order_number)
 
+    @_synchronized
     def update_discord_noti_channel(self, discord_user_id, discord_channel_id, booth_item_number):
         booth_order_number = self.get_booth_order_number(booth_item_number, discord_user_id)
         if not booth_order_number:
@@ -268,6 +289,7 @@ class BoothPostgres:
             ''', (discord_channel_id, booth_order_number))
             return cursor.rowcount
 
+    @_synchronized
     def get_booth_order_number(self, booth_item_number, discord_user_id):
         with self.conn.cursor() as cursor:
             cursor.execute('''
@@ -277,6 +299,7 @@ class BoothPostgres:
             result = cursor.fetchone()
         return result[0] if result else None
     
+    @_synchronized
     def get_booth_item_count(self, discord_user_id):
         with self.conn.cursor() as cursor:
             cursor.execute('SELECT COUNT(*) FROM booth_items WHERE discord_user_id = %s', (discord_user_id,))
