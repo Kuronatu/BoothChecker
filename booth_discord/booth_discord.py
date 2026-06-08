@@ -146,20 +146,24 @@ class DiscordBot(commands.Bot):
             s3_object_url = data.get("s3_object_url")
             summary = data.get("summary")
 
-            await self.send_message(
-                name,
-                url,
-                thumb,
-                item_number,
-                local_version_list,
-                download_short_list,
-                author_info,
-                number_show,
-                changelog_show,
-                channel_id,
-                s3_object_url,
-                summary
-            )
+            try:
+                await self.send_message(
+                    name,
+                    url,
+                    thumb,
+                    item_number,
+                    local_version_list,
+                    download_short_list,
+                    author_info,
+                    number_show,
+                    changelog_show,
+                    channel_id,
+                    s3_object_url,
+                    summary
+                )
+            except Exception as e:
+                self.logger.exception("send_message failed")
+                return jsonify({"status": "send failed", "error": str(e)}), 502
 
             return jsonify({"status": "Message sent"}), 200
 
@@ -176,7 +180,11 @@ class DiscordBot(commands.Bot):
             data = await request.get_json()
             channel_id = data.get("channel_id")
             file = data.get("file")
-            await self.send_changelog(channel_id, file)
+            try:
+                await self.send_changelog(channel_id, file)
+            except Exception as e:
+                self.logger.exception("send_changelog failed")
+                return jsonify({"status": "send failed", "error": str(e)}), 502
             return jsonify({"status": "Message sent"}), 200
 
     async def send_message(self, name, url, thumb, item_number, local_version_list, download_short_list, author_info, number_show, changelog_show, channel_id, s3_object_url=None, summary=None):
@@ -213,12 +221,12 @@ class DiscordBot(commands.Bot):
             embed.add_field(name="요약", value=str(summary), inline=False)
         embed.set_footer(text="BOOTH.pm", icon_url="https://booth.pm/static-images/pwa/icon_size_128.png")
 
-        channel = self.get_channel(int(channel_id))
+        channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
         await channel.send(content="@here", embed=embed)
 
     async def send_error_message(self, channel_id, discord_user_id):
-        channel = self.get_channel(int(channel_id))
-        
+        channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+
         key = f'{discord_user_id}_error_count'
         count = self.error_counts.get(key, 0) + 1
         self.logger.warning(f"Error checking items for user {discord_user_id}. Error count: {count}")
@@ -243,7 +251,7 @@ class DiscordBot(commands.Bot):
             self.logger.info(f"Sent persistent error notification to user {discord_user_id}")
 
     async def send_changelog(self, channel_id, file):
-        channel = self.get_channel(int(channel_id))
+        channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
         await channel.send(file=discord.File(file))
 
     async def on_ready(self):

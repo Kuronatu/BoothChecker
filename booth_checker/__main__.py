@@ -13,7 +13,6 @@ from time import sleep
 from concurrent.futures import ThreadPoolExecutor
 from jinja2 import Environment, FileSystemLoader
 
-from operator import length_hint
 from unitypackage_extractor.extractor import extractPackage
 
 try:
@@ -148,12 +147,10 @@ def load_and_compare_version(order_num, download_short_list, fbx_only):
         version_json['short-list'] = []
 
     local_list = version_json.get('short-list', [])
-    
-    has_changed = not (
-        length_hint(local_list) == length_hint(download_short_list) and
-        ((not local_list and not download_short_list) or
-         (local_list and download_short_list and local_list[0] == download_short_list[0] and local_list[-1] == download_short_list[-1]))
-    )
+
+    # 다운로드 ID 집합 전체를 비교한다. 과거에는 길이 + 첫/끝 원소만 비교해
+    # 중간 파일만 교체되면 변경을 놓치는 경우가 있었다(순서 변화 자체는 무시).
+    has_changed = sorted(local_list) != sorted(download_short_list)
 
     if not has_changed:
         logger.info('nothing has changed.')
@@ -324,10 +321,15 @@ def generate_fbx_changelog_and_summary(item_data, download_url_list, version_jso
     return changelog_html_path, s3_object_url, summary_result, True, current_fbx
 
 def send_discord_notification(item_data, product_info, thumb, local_list_name, item_name_list, changelog_html_path, s3_object_url, summary_result):
-    """Sends update notification to Discord."""
+    """Sends update notification to Discord.
+
+    Returns True only when delivery is confirmed (every required POST returned
+    200). Returns False on any failure so the caller can skip advancing the
+    version file and have the notification re-sent on the next cycle.
+    """
     if DRY_RUN:
         logger.info('Dry run: Skipping Discord notification.')
-        return
+        return True
 
     api_url = f'{discord_api_url}/send_message'
     product_name, product_url = product_info
@@ -348,21 +350,33 @@ def send_discord_notification(item_data, product_info, thumb, local_list_name, i
         'summary': summary_result,
     }
 
-    response = requests.post(api_url, json=data)
-    
+    try:
+        response = requests.post(api_url, json=data, timeout=30)
+    except requests.RequestException as e:
+        logger.error(f'send_message API 요청 실패: {e}')
+        return False
+
     if response.status_code == 200:
         logger.info('send_message API 요청 성공')
     else:
         logger.error(f'send_message API 요청 실패: {response.text}')
-    
+        return False
+
     if item_data["changelog_show"] and changelog_html_path and not s3:
         api_url = f'{discord_api_url}/send_changelog'
         data = {'file': changelog_html_path, 'channel_id': item_data["discord_channel_id"]}
-        response = requests.post(api_url, json=data)
+        try:
+            response = requests.post(api_url, json=data, timeout=30)
+        except requests.RequestException as e:
+            logger.error(f'send_changelog API 요청 실패: {e}')
+            return False
         if response.status_code == 200:
             logger.info('send_changelog API 요청 성공')
         else:
             logger.error(f'send_changelog API 요청 실패: {response.text}')
+            return False
+
+    return True
 
 def update_version_file(version_file_path, version_json, item_name_list, download_short_list, fbx_only=False, new_fbx_records=None):
     """Cleans up and saves the updated version file."""
@@ -431,11 +445,18 @@ def init_update_check(item): # This is the main orchestrator function
 
     thumb = thumblist[0] if thumblist else "https://asset.booth.pm/assets/thumbnail_placeholder_f_150x150-73e650fbec3b150090cbda36377f1a3402c01e36fa067d01.png"
 
-    send_discord_notification(
+    delivered = send_discord_notification(
         item_data, (product_name, product_url), thumb, local_list_name,
         item_name_list, changelog_html_path, s3_object_url, summary_result
     )
-    
+
+    if not delivered:
+        logger.error(
+            f'Discord 전달이 확인되지 않아 버전 파일을 갱신하지 않습니다. '
+            f'다음 사이클에 재발송됩니다. (order {order_num})'
+        )
+        return
+
     update_version_file(version_file_path, version_json, item_name_list, download_short_list, item_data["fbx_only"], new_fbx_records)
 
 def generate_path_info(root, saved_prehash):
