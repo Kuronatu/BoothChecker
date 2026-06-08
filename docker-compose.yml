@@ -1,6 +1,6 @@
 services:
   booth-checker:
-    image: ghcr.io/max-flavor/booth-checker:latest
+    image: ghcr.io/kurovinyl/booth-checker:latest
     volumes:
       - ./version:/root/boothchecker/version
       - ./archive:/root/boothchecker/archive
@@ -16,13 +16,13 @@ services:
         max-file: "3"
       
   booth-discord:
-    image: ghcr.io/max-flavor/booth-discord:latest
+    image: ghcr.io/kurovinyl/booth-discord:latest
     volumes:
       - ./version:/root/boothchecker/version
       - ./changelog:/root/boothchecker/changelog
       - ./config.json:/root/boothchecker/config.json
     depends_on:
-      - porstgres
+      - postgres
       - chrome
     restart: unless-stopped
     logging:
