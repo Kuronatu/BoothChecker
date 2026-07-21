@@ -496,7 +496,9 @@ def init_update_check(item): # This is the main orchestrator function
                 diff_found = calc_diff_found or diff_found
 
         if item_data["fbx_only"] and not diff_found:
-            logger.info('FBX contents unchanged. Skipping notification.')
+            logger.info(
+                f'FBX 변경점이 없어 알림을 건너뛰고 버전 파일만 {download_short_list}(으)로 갱신합니다. (fbx_only)'
+            )
             update_version_file(version_file_path, version_json, item_name_list, download_short_list, item_data["fbx_only"], new_fbx_records)
             return
 
