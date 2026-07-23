@@ -2,7 +2,10 @@ from google import genai
 from google.genai import types
 
 class google_gemini_api:
-    def __init__(self, gemini_api_key):
+    DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+    def __init__(self, gemini_api_key, model=None):
+        self.model = model or self.DEFAULT_MODEL
         self.sys_instruct = """
             너는 파일 리스트 요약 전문가야. 한국어로 1024자 이내로 요약해.
             내가 주는 리스트는 "{파일명} {Added/Deleted/Changed}" 형식이야.  
@@ -15,7 +18,7 @@ class google_gemini_api:
     def chat(self, message):
         try:
             response = self.client.models.generate_content(
-                model="gemini-3.5-flash",
+                model=self.model,
                 config=types.GenerateContentConfig(
                     system_instruction=self.sys_instruct),
                 contents=[message]

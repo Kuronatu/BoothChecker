@@ -928,8 +928,10 @@ if __name__ == "__main__":
     # Configure global settings
     discord_api_url = config_json['discord_api_url']
     gemini_api_key = config_json.get('gemini_api_key')
+    gemini_model = config_json.get('gemini_model') or llm_summary.google_gemini_api.DEFAULT_MODEL
     if gemini_api_key:
-        summary = llm_summary.google_gemini_api(gemini_api_key)
+        summary = llm_summary.google_gemini_api(gemini_api_key, model=gemini_model)
+        logger.info("Gemini summary enabled with model: %s", gemini_model)
     else:
         summary = None
         logger.info("Gemini API key not found")

@@ -23,6 +23,7 @@ BOOTH.pm의 아이템 업데이트를 주기적으로 확인하고 업데이트 
     "discord_api_url": "http://booth-discord:5000",
     "discord_bot_token": "YOUR_DISCORD_BOT_TOKEN",
     "gemini_api_key": "YOUR_GEMINI_API_KEY",
+    "gemini_model": "gemini-3.5-flash-lite",
     "s3":
         {
             "endpoint_url": "YOUR_S3_ENDPOINT_URL",
@@ -43,6 +44,10 @@ changelog.html을 S3에 업로드하고, Discord Embed에서 마스킹된 링크
 #### 'gemini_api_key' (선택사항)
 
 변경점을 Google Gemini를 통해 요약합니다.
+
+#### 'gemini_model' (선택사항)
+
+요약에 사용할 Gemini 모델을 지정합니다. 생략하면 기본값 `gemini-3.5-flash-lite`를 사용합니다.
 
 ---
 
