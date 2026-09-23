@@ -1,3 +1,4 @@
+import copy
 import shutil
 import zipfile
 import hashlib
@@ -40,6 +41,22 @@ thread_local = threading.local()
 # do not POST /reset_error once per item per cycle).
 reset_users_this_cycle = set()
 reset_users_lock = threading.Lock()
+
+# Consecutive changelog failures per order: {order_num: (download_set, count)}.
+# A deterministic parse failure (password-protected zip, unsupported
+# compression, broken unitypackage) would otherwise block the item forever, so
+# after CHANGELOG_MAX_ATTEMPTS tries on the same download set we notify without
+# a changelog and advance the version file.
+CHANGELOG_MAX_ATTEMPTS = 3
+changelog_failures = {}
+changelog_failures_lock = threading.Lock()
+
+CHANGELOG_FAILED_NOTE = '⚠️ 파일 분석에 실패해 변경 내역 없이 알립니다.'
+
+# send_discord_notification outcomes
+DELIVERED = 'delivered'
+DELIVERY_FAILED = 'failed'      # transient (network/5xx): keep version, retry next cycle
+DELIVERY_REJECTED = 'rejected'  # permanent (4xx): a retry would fail the same way
 
 class ContextFilter(logging.Filter):
     def filter(self, record):
@@ -352,13 +369,16 @@ def generate_fbx_changelog_and_summary(item_data, download_url_list, version_jso
 def send_discord_notification(item_data, product_info, thumb, local_list_name, item_name_list, changelog_html_path, s3_object_url, summary_result):
     """Sends update notification to Discord.
 
-    Returns True only when delivery is confirmed (every required POST returned
-    200). Returns False on any failure so the caller can skip advancing the
-    version file and have the notification re-sent on the next cycle.
+    Returns DELIVERED once /send_message returned 200 (the changelog attachment
+    is best-effort: failing it must not re-send the @here embed every cycle).
+    Returns DELIVERY_FAILED on a transient failure so the caller skips advancing
+    the version file and re-sends next cycle, and DELIVERY_REJECTED when
+    booth_discord reports a permanent 4xx (deleted channel, missing permission,
+    invalid embed) that no retry can fix.
     """
     if DRY_RUN:
         logger.info('Dry run: Skipping Discord notification.')
-        return True
+        return DELIVERED
 
     api_url = f'{discord_api_url}/send_message'
     product_name, product_url = product_info
@@ -383,13 +403,16 @@ def send_discord_notification(item_data, product_info, thumb, local_list_name, i
         response = requests.post(api_url, json=data, timeout=30)
     except requests.RequestException as e:
         logger.error(f'send_message API 요청 실패: {e}')
-        return False
+        return DELIVERY_FAILED
 
     if response.status_code == 200:
         logger.info('send_message API 요청 성공')
+    elif response.status_code in (400, 422):  # booth_discord: bad payload / permanent Discord error
+        logger.error(f'send_message API 영구 실패({response.status_code}): {response.text}')
+        return DELIVERY_REJECTED
     else:
         logger.error(f'send_message API 요청 실패: {response.text}')
-        return False
+        return DELIVERY_FAILED
 
     if item_data["changelog_show"] and changelog_html_path and not s3:
         api_url = f'{discord_api_url}/send_changelog'
@@ -397,15 +420,14 @@ def send_discord_notification(item_data, product_info, thumb, local_list_name, i
         try:
             response = requests.post(api_url, json=data, timeout=30)
         except requests.RequestException as e:
-            logger.error(f'send_changelog API 요청 실패: {e}')
-            return False
+            logger.error(f'send_changelog API 요청 실패(알림은 전달됨): {e}')
+            return DELIVERED
         if response.status_code == 200:
             logger.info('send_changelog API 요청 성공')
         else:
-            logger.error(f'send_changelog API 요청 실패: {response.text}')
-            return False
+            logger.error(f'send_changelog API 요청 실패(알림은 전달됨): {response.text}')
 
-    return True
+    return DELIVERED
 
 def update_version_file(version_file_path, version_json, item_name_list, download_short_list, fbx_only=False, new_fbx_records=None):
     """Cleans up and saves the updated version file."""
@@ -434,6 +456,20 @@ def update_version_file(version_file_path, version_json, item_name_list, downloa
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, version_file_path)
+
+def record_changelog_failure(order_num, download_short_list):
+    """Counts consecutive changelog failures for this exact download set and
+    returns the new count (a different download set starts over at 1)."""
+    download_set = tuple(sorted(download_short_list))
+    with changelog_failures_lock:
+        prev_set, count = changelog_failures.get(order_num, (None, 0))
+        count = count + 1 if prev_set == download_set else 1
+        changelog_failures[order_num] = (download_set, count)
+    return count
+
+def clear_changelog_failure(order_num):
+    with changelog_failures_lock:
+        changelog_failures.pop(order_num, None)
 
 def init_update_check(item): # This is the main orchestrator function
     item_data = prepare_item_data(item)
@@ -480,16 +516,32 @@ def init_update_check(item): # This is the main orchestrator function
         new_fbx_records = None
 
         if item_data["changelog_show"] or item_data["fbx_only"]:
+            # Changelog generation marks version_json nodes in place; keep the
+            # last good tree so a give-up fallback does not save a partial one.
+            baseline_json = copy.deepcopy(version_json)
             try:
                 changelog_html_path, s3_object_url, summary_result, calc_diff_found, new_fbx_records = generate_changelog_and_summary(
                     item_data, download_url_list, version_json, download_dir, process_dir
                 )
             except ChangelogError as e:
+                attempts = record_changelog_failure(order_num, download_short_list)
+                if attempts < CHANGELOG_MAX_ATTEMPTS:
+                    logger.error(
+                        f'변경점 분석 실패로 알림/버전 갱신을 건너뜁니다. '
+                        f'다음 사이클에 재시도합니다. ({attempts}/{CHANGELOG_MAX_ATTEMPTS}, order {order_num}): {e}'
+                    )
+                    return
                 logger.error(
-                    f'변경점 분석 실패로 알림/버전 갱신을 건너뜁니다. '
-                    f'다음 사이클에 재시도합니다. (order {order_num}): {e}'
+                    f'변경점 분석이 {attempts}회 연속 실패해 변경 내역 없이 알리고 '
+                    f'버전 파일을 갱신합니다. (order {order_num}): {e}'
                 )
-                return
+                # The next analyzable update then diffs against the last
+                # successfully parsed tree instead of a half-marked one.
+                version_json = baseline_json
+                calc_diff_found, new_fbx_records = True, None
+                summary_result = CHANGELOG_FAILED_NOTE
+            else:
+                clear_changelog_failure(order_num)
             if item_data["fbx_only"]:
                 diff_found = calc_diff_found
             elif item_data["changelog_show"]:
@@ -504,19 +556,24 @@ def init_update_check(item): # This is the main orchestrator function
 
         thumb = thumblist[0] if thumblist else "https://asset.booth.pm/assets/thumbnail_placeholder_f_150x150-73e650fbec3b150090cbda36377f1a3402c01e36fa067d01.png"
 
-        delivered = send_discord_notification(
+        outcome = send_discord_notification(
             item_data, (product_name, product_url), thumb, local_list_name,
             item_name_list, changelog_html_path, s3_object_url, summary_result
         )
 
-        if not delivered:
+        if outcome == DELIVERY_FAILED:
             logger.error(
                 f'Discord 전달이 확인되지 않아 버전 파일을 갱신하지 않습니다. '
                 f'다음 사이클에 재발송됩니다. (order {order_num})'
             )
             return
+        if outcome == DELIVERY_REJECTED:
+            logger.error(
+                f'재시도해도 전달할 수 없어 알림 없이 버전 파일을 갱신합니다. (order {order_num})'
+            )
 
         update_version_file(version_file_path, version_json, item_name_list, download_short_list, item_data["fbx_only"], new_fbx_records)
+        clear_changelog_failure(order_num)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         # Drop the local changelog HTML once it has been delivered/uploaded.
@@ -647,7 +704,7 @@ def try_extract(input_path, input_filename, output_path, encoding, temp_dir):
 
     try:
         if zip_type == 1:  # zip
-            with zipfile.ZipFile(temp_output, 'r', metadata_encoding=encoding) as zip_file:
+            with open_zip(temp_output, encoding) as zip_file:
                 zip_file.extractall(output_path)
         elif zip_type == 2:  # unitypackage
             extractPackage(temp_output, outputPath=output_path)
@@ -656,6 +713,24 @@ def try_extract(input_path, input_filename, output_path, encoding, temp_dir):
 
     return zip_type
 
+
+def open_zip(path, encoding):
+    """Opens a zip, decoding names without the UTF-8 flag as @encoding.
+
+    macOS-made zips store UTF-8 names without the flag, which fails strict
+    decoding as shift_jis (the default), and Windows names often use cp932
+    extensions (①, Ⅱ, 髙) that strict shift_jis rejects. Fall back to UTF-8
+    (before cp932, which would accept some UTF-8 byte pairs as mojibake),
+    then cp932, and finally cp437, which decodes any bytes, instead of
+    failing the whole changelog. @encoding stays first so names that parsed
+    before keep decoding identically.
+    """
+    for candidate in (encoding, 'utf-8', 'cp932'):
+        try:
+            return zipfile.ZipFile(path, 'r', metadata_encoding=candidate)
+        except (UnicodeDecodeError, LookupError) as e:
+            logger.warning(f'zip 파일명을 {candidate}(으)로 해석하지 못했습니다: {e}')
+    return zipfile.ZipFile(path, 'r', metadata_encoding='cp437')
 
 def is_compressed(path):
 ###

@@ -115,8 +115,13 @@ def download_item(download_number, filepath, cookie):
 
 
 def crawling_product(url):
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
+    # Author info is optional decoration: a deleted/private/unreachable product
+    # page must not block the update notification.
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
     html = response.content
 
     soup = BeautifulSoup(html, "html.parser")
