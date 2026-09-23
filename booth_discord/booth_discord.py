@@ -6,6 +6,34 @@ from pytz import timezone
 from quart import Quart, request, jsonify
 import asyncio
 
+EMBED_TITLE_LIMIT = 256
+EMBED_FIELD_LIMIT = 1024
+
+def _failure_status(exc):
+    """Discord 4xx errors (unknown channel, missing permissions, invalid form
+    body) fail the same way on every retry, so report them as 422 and let the
+    checker stop retrying; anything else (5xx, network) stays a retryable 502."""
+    if isinstance(exc, discord.HTTPException) and 400 <= exc.status < 500 and exc.status != 429:
+        return 422
+    return 502
+
+def _clip_field(value, limit=EMBED_FIELD_LIMIT):
+    """Trims a newline-separated list at a line boundary so it fits Discord's
+    embed field limit, noting how many lines were dropped."""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    lines = text.split('\n')
+    budget = limit - len(f'\n… 외 {len(lines)}개')
+    kept, used = [], 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > budget:
+            break
+        kept.append(line)
+        used += cost
+    return '\n'.join(kept + [f'… 외 {len(lines) - len(kept)}개'])
+
 class DiscordBot(commands.Bot):
     def __init__(self, booth_db, logger, fbx_only, *args, **kwargs):
         intents = discord.Intents.default()
@@ -170,7 +198,7 @@ class DiscordBot(commands.Bot):
                 )
             except Exception as e:
                 self.logger.exception("send_message failed")
-                return jsonify({"status": "send failed", "error": str(e)}), 502
+                return jsonify({"status": "send failed", "error": str(e)}), _failure_status(e)
 
             return jsonify({"status": "Message sent"}), 200
 
@@ -185,7 +213,7 @@ class DiscordBot(commands.Bot):
                 await self.send_error_message(channel_id, user_id)
             except Exception as e:
                 self.logger.exception("send_error_message failed")
-                return jsonify({"status": "send failed", "error": str(e)}), 502
+                return jsonify({"status": "send failed", "error": str(e)}), _failure_status(e)
             return jsonify({"status": "Error message sent"}), 200
 
         @self.app.route("/reset_error", methods=["POST"])
@@ -208,7 +236,7 @@ class DiscordBot(commands.Bot):
                 await self.send_changelog(channel_id, file)
             except Exception as e:
                 self.logger.exception("send_changelog failed")
-                return jsonify({"status": "send failed", "error": str(e)}), 502
+                return jsonify({"status": "send failed", "error": str(e)}), _failure_status(e)
             return jsonify({"status": "Message sent"}), 200
 
     async def send_message(self, name, url, thumb, item_number, local_version_list, download_short_list, author_info, number_show, changelog_show, channel_id, s3_object_url=None, summary=None):
@@ -220,29 +248,27 @@ class DiscordBot(commands.Bot):
         if changelog_show and s3_object_url:
             description = f'{description} \n ## [변경사항 보기]({s3_object_url})'
 
-        if author_info is not None:
-            author_icon = author_info[0]
-            author_name = author_info[1] + " "
-        else:
-            author_icon = ""
-            author_name = ""
-
+        # Discord rejects oversized embeds with 400 Invalid Form Body, so clip
+        # long titles and file lists (many per-avatar zips) instead of failing.
         embed = discord.Embed(
-            title=name,
+            title=str(name)[:EMBED_TITLE_LIMIT],
             description=description,
             url=url,
             colour=discord.Color.blurple(),
             timestamp=datetime.now(timezone('Asia/Seoul'))
         )
-        embed.set_author(name=author_name, icon_url=author_icon)
+        # An empty author name/icon URL is rejected by Discord (400), which
+        # would drop the whole notification, so omit the author when unknown.
+        if author_info:
+            embed.set_author(name=author_info[1] + " ", icon_url=author_info[0])
         embed.set_thumbnail(url=thumb)
         embed.add_field(name="아이템 번호", value=str(item_number), inline=False)
         if number_show:
             if local_version_list:
-                embed.add_field(name="LOCAL", value=str(local_version_list), inline=True)
-            embed.add_field(name="BOOTH", value=str(download_short_list), inline=True)
-        if summary: 
-            embed.add_field(name="요약", value=str(summary), inline=False)
+                embed.add_field(name="LOCAL", value=_clip_field(local_version_list), inline=True)
+            embed.add_field(name="BOOTH", value=_clip_field(download_short_list), inline=True)
+        if summary:
+            embed.add_field(name="요약", value=_clip_field(summary), inline=False)
         embed.set_footer(text="BOOTH.pm", icon_url="https://booth.pm/static-images/pwa/icon_size_128.png")
 
         channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
