@@ -2,11 +2,8 @@ import requests
 import re
 from bs4 import BeautifulSoup
 
-def _extract_download_info(div, link_selector, filename_selector):
-    download_link = div.select_one(link_selector)
-    filename_div = div.select_one(filename_selector)
-    
-    if not download_link or not filename_div:
+def _extract_download_info(download_link, filename_div):
+    if not filename_div:
         return None
 
     href = download_link.get("data-href") or download_link.get("href")
@@ -20,6 +17,15 @@ def _extract_download_info(div, link_selector, filename_selector):
         return None
 
     return [match.group(1), filename]
+
+def _find_download_filename(download_link, product_div, filename_selector):
+    container = download_link.parent
+    while container and container is not product_div:
+        filename_div = container.select_one(filename_selector)
+        if filename_div:
+            return filename_div
+        container = container.parent
+    return None
 
 def _crawling_base(url, cookie, selectors, shortlist, thumblist, product_only_filter=None):
     response = requests.get(url=url, cookies=cookie, timeout=30)
@@ -58,9 +64,12 @@ def _crawling_base(url, cookie, selectors, shortlist, thumblist, product_only_fi
         if thumb_link and thumblist is not None:
             thumblist.append(thumb_link.get("src"))
         
-        download_item_divs = product_div.select(selectors['download_item_selector'])
-        for div in download_item_divs:
-            info = _extract_download_info(div, selectors['download_link_selector'], selectors['filename_selector'])
+        download_links = product_div.select(selectors['download_link_selector'])
+        for download_link in download_links:
+            filename_div = _find_download_filename(
+                download_link, product_div, selectors['filename_selector']
+            )
+            info = _extract_download_info(download_link, filename_div)
             if info:
                 download_url_list.append(info)
                 if shortlist is not None:
@@ -76,10 +85,6 @@ def crawling(order_num, product_only, cookie, shortlist=None, thumblist=None):
         'product_info_selector': 'a',
         'product_info_index': 1,
         'thumb_selector': 'img',
-        'download_item_selector': (
-            'div.legacy-list-item__center, '
-            'div.mt-16.desktop\\:flex.desktop\\:justify-between.desktop\\:items-center'
-        ),
         'download_link_selector': (
             'div.js-download-button[data-test="downloadable"][data-href*="/downloadables/"], '
             'a.nav-reverse[href*="/downloadables/"]'
@@ -99,7 +104,6 @@ def crawling_gift(order_num, cookie, shortlist=None, thumblist=None):
         'product_div_class': 'rounded-16 bg-white p-40 mobile:px-16 mobile:pt-24 mobile:pb-40 mobile:rounded-none',
         'product_info_selector': 'div.mt-24.text-left a',
         'thumb_selector': 'img',
-        'download_item_selector': 'div.mt-16.desktop\\:flex.desktop\\:justify-between.desktop\\:items-center',
         'download_link_selector': 'div.js-download-button[data-test="downloadable"][data-href*="/downloadables/"]',
         'filename_selector': 'div.min-w-0.break-words.whitespace-pre-line, div.min-w-0.u-text-wrap b'
     }
