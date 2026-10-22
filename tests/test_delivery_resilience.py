@@ -67,6 +67,40 @@ class FakeResponse:
         self.text = text
 
 
+class GeminiConfigTests(unittest.TestCase):
+    @mock.patch.object(checker.llm_summary.genai, "Client")
+    def test_missing_or_invalid_model_disables_summary_even_with_api_key(self, client):
+        configs = [{"gemini_api_key": "test-key"}]
+        configs.extend(
+            {"gemini_api_key": "test-key", "gemini_model": value}
+            for value in (None, "", "  \t", 123, False, [], {})
+        )
+        for config in configs:
+            with self.subTest(config=config):
+                self.assertIsNone(checker.create_summary(config))
+        client.assert_not_called()
+
+    @mock.patch.object(checker.llm_summary.genai, "Client")
+    def test_model_without_api_key_disables_summary(self, client):
+        self.assertIsNone(checker.create_summary({"gemini_model": "configured-model"}))
+        client.assert_not_called()
+
+    @mock.patch.object(checker.llm_summary.genai, "Client")
+    def test_configured_model_is_sent_to_gemini(self, client):
+        summary = checker.create_summary({
+            "gemini_api_key": "test-key", "gemini_model": "  configured-model  ",
+        })
+        client.assert_called_once_with(api_key="test-key")
+        client.return_value.models.generate_content.return_value = types.SimpleNamespace(
+            candidates=[types.SimpleNamespace(content=types.SimpleNamespace(
+                parts=[types.SimpleNamespace(text="변경: Body.fbx")],
+            ))],
+        )
+        self.assertEqual(summary.chat("Body.fbx (Changed)"), "변경: Body.fbx")
+        call = client.return_value.models.generate_content.call_args
+        self.assertEqual(call.kwargs["model"], "configured-model")
+
+
 class PipelineHarness(unittest.TestCase):
     """Runs the real init_update_check against mocked BOOTH/booth_discord."""
 
@@ -84,7 +118,7 @@ class PipelineHarness(unittest.TestCase):
 
         for attr, value in {
             "DRY_RUN": False, "discord_api_url": "http://discord", "s3": None,
-            "s3_uploader": None, "gemini_api_key": None, "summary": None,
+            "s3_uploader": None, "summary": None,
         }.items():
             patcher = mock.patch.object(checker, attr, value, create=True)
             patcher.start()
@@ -130,15 +164,34 @@ class PipelineHarness(unittest.TestCase):
         with open(f"version/json/{self.ORDER}.json") as f:
             return simdjson.load(f)
 
-    def run_cycle(self, encoding="shift_jis", fbx_only=False):
+    def run_cycle(self, encoding="shift_jis", fbx_only=False, summary_this=False):
         checker.reset_users_this_cycle.clear()
         self.posts.clear()
-        item = (self.ORDER, 1, None, encoding, True, True, False, False, False, fbx_only, "cookie", "u1", "42")
+        item = (self.ORDER, 1, None, encoding, True, True, False, False, summary_this, fbx_only, "cookie", "u1", "42")
         checker.init_update_check(item)
         return [route for route, _ in self.posts if route != "reset_error"]
 
     def payload(self, route):
         return next(body for r, body in self.posts if r == route)
+
+
+class DisabledSummaryTests(PipelineHarness):
+    def check_disabled_summary(self, fbx_only):
+        with mock.patch.object(checker.llm_summary.genai, "Client") as client:
+            checker.summary = checker.create_summary({"gemini_api_key": "test-key"})
+            self.zip_data = _zip_bytes(["model.fbx"])
+            self.assertEqual(
+                self.run_cycle(fbx_only=fbx_only, summary_this=True),
+                ["send_message", "send_changelog"],
+            )
+            self.assertIsNone(self.payload("send_message")["summary"])
+            client.assert_not_called()
+
+    def test_regular_changelog_works_without_summary(self):
+        self.check_disabled_summary(fbx_only=False)
+
+    def test_fbx_changelog_works_without_summary(self):
+        self.check_disabled_summary(fbx_only=True)
 
 
 class ChangelogRetryCapTests(PipelineHarness):

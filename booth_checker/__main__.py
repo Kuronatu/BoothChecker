@@ -276,11 +276,11 @@ def generate_changelog_and_summary(item_data, download_url_list, version_json, d
     
     summary_result = None
     summary_data = files_list(tree)
-    if item_data["summary_this"] and gemini_api_key and summary_data and not DRY_RUN:
+    if item_data["summary_this"] and summary is not None and summary_data and not DRY_RUN:
         logger.info('Generating summary')
         summary_result = f"{summary.chat(summary_data)}"
         logger.debug(summary_result)
-    elif item_data["summary_this"] and gemini_api_key and summary_data and DRY_RUN:
+    elif item_data["summary_this"] and summary is not None and summary_data and DRY_RUN:
         logger.info('Dry run: Skipping summary generation.')
     
     s3_object_url = None
@@ -331,11 +331,11 @@ def generate_fbx_changelog_and_summary(item_data, download_url_list, version_jso
     s3_object_url = None
     summary_result = None
 
-    if item_data["summary_this"] and gemini_api_key and summary_data and not DRY_RUN:
+    if item_data["summary_this"] and summary is not None and summary_data and not DRY_RUN:
         logger.info('Generating summary')
         summary_result = f"{summary.chat(summary_data)}"
         logger.debug(summary_result)
-    elif item_data["summary_this"] and gemini_api_key and summary_data and DRY_RUN:
+    elif item_data["summary_this"] and summary is not None and summary_data and DRY_RUN:
         logger.info('Dry run: Skipping summary generation.')
 
     if item_data["changelog_show"]:
@@ -985,6 +985,17 @@ def run_update_check_safely(item):
 def strftime_now():
     return datetime.now().strftime('%Y%m%d-%H%M%S')
 
+def create_summary(config):
+    api_key = config.get('gemini_api_key')
+    model = config.get('gemini_model')
+    if not api_key or not isinstance(model, str) or not model.strip():
+        logger.info("Gemini summary disabled: gemini_api_key and gemini_model are required")
+        return None
+
+    summary = llm_summary.google_gemini_api(api_key, model=model.strip())
+    logger.info("Gemini summary enabled with model: %s", summary.model)
+    return summary
+
 if __name__ == "__main__":
     with open("config.json") as file:
         config_json = simdjson.load(file)
@@ -1002,14 +1013,7 @@ if __name__ == "__main__":
         
     # Configure global settings
     discord_api_url = config_json['discord_api_url']
-    gemini_api_key = config_json.get('gemini_api_key')
-    gemini_model = config_json.get('gemini_model') or llm_summary.google_gemini_api.DEFAULT_MODEL
-    if gemini_api_key:
-        summary = llm_summary.google_gemini_api(gemini_api_key, model=gemini_model)
-        logger.info("Gemini summary enabled with model: %s", gemini_model)
-    else:
-        summary = None
-        logger.info("Gemini API key not found")
+    summary = create_summary(config_json)
         
     refresh_interval = int(config_json['refresh_interval'])
 
